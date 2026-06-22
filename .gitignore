@@ -1,6 +1,33 @@
+# Build output
 build/
+.cache/
+
+# Compiled objects
 *.exe
 *.o
 *.a
 *.d
-.cache/
+
+# Generated exports (large, user-produced)
+V_surface_*.bmp
+V_surface_*.csv
+
+# ImGui saved UI state
+imgui.ini
+
+# Raw screenshots (clean copies live in assets/)
+Screenshot *.jpg
+Screenshot *.png
+Screenshot*.jpg
+Screenshot*.png
+
+# Raw WhatsApp images (clean copies live in assets/)
+WhatsApp Image*.jpeg
+WhatsApp Image*.jpg
+
+# Personal Obsidian vault
+obsidian vault/
+
+# Windows
+Thumbs.db
+desktop.ini
