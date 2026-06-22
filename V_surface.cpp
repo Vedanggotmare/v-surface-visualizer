@@ -24,6 +24,9 @@
 #include <string>
 #include <cstring>
 #include <cfloat>
+#include <ctime>
+#include <cstdint>
+#include <cstdio>
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846
 #endif
@@ -32,6 +35,43 @@
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl2.h"
+
+// =============================================================================
+//  FBO extension loader (for 4K offscreen export)
+// =============================================================================
+#ifndef GL_FRAMEBUFFER
+#  define GL_FRAMEBUFFER          0x8D40u
+#  define GL_RENDERBUFFER         0x8D41u
+#  define GL_COLOR_ATTACHMENT0    0x8CE0u
+#  define GL_DEPTH_ATTACHMENT     0x8D00u
+#  define GL_FRAMEBUFFER_COMPLETE 0x8CD5u
+#endif
+#ifndef GL_DEPTH_COMPONENT24
+#  define GL_DEPTH_COMPONENT24    0x81A6u
+#endif
+
+typedef void   (APIENTRY *PFN_glGenFBO   )(GLsizei, GLuint*);
+typedef void   (APIENTRY *PFN_glBindFBO  )(GLenum, GLuint);
+typedef void   (APIENTRY *PFN_glFBOTex2D )(GLenum, GLenum, GLenum, GLuint, GLint);
+typedef void   (APIENTRY *PFN_glDelFBO   )(GLsizei, const GLuint*);
+typedef void   (APIENTRY *PFN_glGenRBO   )(GLsizei, GLuint*);
+typedef void   (APIENTRY *PFN_glBindRBO  )(GLenum, GLuint);
+typedef void   (APIENTRY *PFN_glRBOStore )(GLenum, GLenum, GLsizei, GLsizei);
+typedef void   (APIENTRY *PFN_glFBORBO   )(GLenum, GLenum, GLenum, GLuint);
+typedef void   (APIENTRY *PFN_glDelRBO   )(GLsizei, const GLuint*);
+typedef GLenum (APIENTRY *PFN_glChkFBO   )(GLenum);
+
+static PFN_glGenFBO    s_GenFBO  = nullptr;
+static PFN_glBindFBO   s_BindFBO = nullptr;
+static PFN_glFBOTex2D  s_FBOTex  = nullptr;
+static PFN_glDelFBO    s_DelFBO  = nullptr;
+static PFN_glGenRBO    s_GenRBO  = nullptr;
+static PFN_glBindRBO   s_BindRBO = nullptr;
+static PFN_glRBOStore  s_RBOStor = nullptr;
+static PFN_glFBORBO    s_FBORBO  = nullptr;
+static PFN_glDelRBO    s_DelRBO  = nullptr;
+static PFN_glChkFBO    s_ChkFBO  = nullptr;
+static bool            g_fbo_ok  = false;
 
 // =============================================================================
 //  Kummer Confluent Hypergeometric  1F1(a; b; z)
@@ -86,6 +126,9 @@ struct Params {
     int   res     = 60;
     float clip_pct = 2.0f;    // percentile clip for colour normalisation (%)
     bool  auto_upd = true;
+    bool  force_pos = false;  // take |V| so all values are non-negative
+    bool  pos_domain = false;   // restrict plot to t>=0, x>=0
+    bool  zoom_domain = false;  // auto-scale x domain with zoom
 };
 
 // =============================================================================
@@ -98,7 +141,7 @@ static double compute_V(double t, double x, const Params& p) {
     double sq  = std::sqrt(std::sqrt(2.0) * (double)p.sigma / M_PI);
     double ep  = std::exp(-0.5 * p.r0 * ((double)p.T_mat * p.T_mat - t * t));
     double tp  = std::pow(tau, 0.25);
-    double g58 = std::tgamma(5.0 / 8.0);
+    double g58 = std::tgamma(3.0 / 4.0);
 
     double drift = (std::abs((double)p.lambda) > 1e-9)
         ? ((double)p.mu0 / p.lambda) *
@@ -109,7 +152,8 @@ static double compute_V(double t, double x, const Params& p) {
     double kum = kummer(-0.25, 0.5, z);
 
     double v = (double)p.gamma_v * sq * ep * tp * g58 * kum;
-    return std::isfinite(v) ? v : 0.0;
+    if (!std::isfinite(v)) return 0.0;
+    return p.force_pos ? std::abs(v) : v;
 }
 
 // =============================================================================
@@ -523,6 +567,305 @@ static void draw_colorbar(float vmin, float vmax, float width) {
 }
 
 // =============================================================================
+//  FBO init, BMP writer, 4K export
+// =============================================================================
+static std::string g_export_status;
+static bool        g_do_export = false;
+
+static void init_fbo_ext() {
+    auto load2 = [](const char* a, const char* b) -> void* {
+        void* p = (void*)glfwGetProcAddress(a);
+        if (!p) p = (void*)glfwGetProcAddress(b);
+        return p;
+    };
+    s_GenFBO  = (PFN_glGenFBO)   load2("glGenFramebuffers",        "glGenFramebuffersEXT");
+    s_BindFBO = (PFN_glBindFBO)  load2("glBindFramebuffer",        "glBindFramebufferEXT");
+    s_FBOTex  = (PFN_glFBOTex2D) load2("glFramebufferTexture2D",   "glFramebufferTexture2DEXT");
+    s_DelFBO  = (PFN_glDelFBO)   load2("glDeleteFramebuffers",     "glDeleteFramebuffersEXT");
+    s_GenRBO  = (PFN_glGenRBO)   load2("glGenRenderbuffers",       "glGenRenderbuffersEXT");
+    s_BindRBO = (PFN_glBindRBO)  load2("glBindRenderbuffer",       "glBindRenderbufferEXT");
+    s_RBOStor = (PFN_glRBOStore) load2("glRenderbufferStorage",    "glRenderbufferStorageEXT");
+    s_FBORBO  = (PFN_glFBORBO)   load2("glFramebufferRenderbuffer","glFramebufferRenderbufferEXT");
+    s_DelRBO  = (PFN_glDelRBO)   load2("glDeleteRenderbuffers",    "glDeleteRenderbuffersEXT");
+    s_ChkFBO  = (PFN_glChkFBO)   load2("glCheckFramebufferStatus", "glCheckFramebufferStatusEXT");
+    g_fbo_ok  = s_GenFBO && s_BindFBO && s_FBOTex && s_DelFBO &&
+                s_GenRBO && s_BindRBO && s_RBOStor && s_FBORBO &&
+                s_DelRBO && s_ChkFBO;
+}
+
+// RGB pixel buffer (bottom-up, matches glReadPixels) → BMP file
+static bool save_bmp(const std::string& path, int w, int h, const uint8_t* rgb) {
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) return false;
+    int row_bytes = (w * 3 + 3) & ~3;
+    int data_size = row_bytes * h;
+    int file_size = 54 + data_size;
+    uint8_t hdr[54] = {};
+    hdr[0]='B'; hdr[1]='M';
+    hdr[2]=(uint8_t)file_size;       hdr[3]=(uint8_t)(file_size>>8);
+    hdr[4]=(uint8_t)(file_size>>16); hdr[5]=(uint8_t)(file_size>>24);
+    hdr[10]=54; hdr[14]=40;
+    hdr[18]=(uint8_t)w;  hdr[19]=(uint8_t)(w>>8);  hdr[20]=(uint8_t)(w>>16);  hdr[21]=(uint8_t)(w>>24);
+    hdr[22]=(uint8_t)h;  hdr[23]=(uint8_t)(h>>8);  hdr[24]=(uint8_t)(h>>16);  hdr[25]=(uint8_t)(h>>24);
+    hdr[26]=1; hdr[28]=24;
+    hdr[34]=(uint8_t)data_size;       hdr[35]=(uint8_t)(data_size>>8);
+    hdr[36]=(uint8_t)(data_size>>16); hdr[37]=(uint8_t)(data_size>>24);
+    fwrite(hdr, 1, 54, f);
+    uint8_t pad[3] = {};
+    for (int y = 0; y < h; y++) {
+        const uint8_t* row = rgb + (size_t)y * w * 3;
+        for (int x = 0; x < w; x++) {
+            uint8_t bgr[3] = { row[x*3+2], row[x*3+1], row[x*3] };
+            fwrite(bgr, 1, 3, f);
+        }
+        int pad_n = row_bytes - w * 3;
+        if (pad_n > 0) fwrite(pad, 1, pad_n, f);
+    }
+    fclose(f);
+    return true;
+}
+
+#ifdef _WIN32
+static void overlay_text_gdi(std::vector<uint8_t>& pixels, int W, int H,
+                              const Surface& surf, const Params& params) {
+    HDC hdc = CreateCompatibleDC(NULL);
+    if (!hdc) return;
+
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth       = W;
+    bmi.bmiHeader.biHeight      = H;   // positive = bottom-up, matches glReadPixels
+    bmi.bmiHeader.biPlanes      = 1;
+    bmi.bmiHeader.biBitCount    = 24;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    BYTE* dib = nullptr;
+    HBITMAP hbm = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, (void**)&dib, NULL, 0);
+    if (!hbm) { DeleteDC(hdc); return; }
+    HGDIOBJ old_bm = SelectObject(hdc, hbm);
+
+    // GL pixels (RGB, bottom-up) → DIB (BGR, bottom-up)
+    int stride = (W * 3 + 3) & ~3;
+    for (int y = 0; y < H; y++) {
+        const uint8_t* s = pixels.data() + (size_t)y * W * 3;
+        BYTE*           d = dib           + (size_t)y * stride;
+        for (int x = 0; x < W; x++) { d[x*3]=s[x*3+2]; d[x*3+1]=s[x*3+1]; d[x*3+2]=s[x*3]; }
+    }
+
+    SetBkMode(hdc, TRANSPARENT);
+
+    const int TS = H / 60;   // tick label px (~36 at 4K)
+    const int PS = H / 70;   // param box px  (~31 at 4K)
+    const float YB = -0.75f, L = 1.20f;
+    const int NK = 5;
+    char buf[128];
+    SIZE sz;
+
+    // project 3D world pt → pixel coords (top-left origin), draw text centered
+    auto draw_cen = [&](float wx, float wy, float wz,
+                         const char* txt, int ox, int oy) {
+        ImVec2 p = project(wx, wy, wz);
+        if (p.x < -400 || p.y < -400 || p.x > W+400 || p.y > H+400) return;
+        GetTextExtentPoint32A(hdc, txt, (int)strlen(txt), &sz);
+        TextOutA(hdc, (int)p.x - sz.cx/2 + ox, (int)p.y - sz.cy/2 + oy, txt, (int)strlen(txt));
+    };
+
+    // right-aligned: text ends margin px to the left of projected point
+    auto draw_right = [&](float wx, float wy, float wz,
+                           const char* txt, int margin) {
+        ImVec2 p = project(wx, wy, wz);
+        if (p.x < -400 || p.y < -400 || p.x > W+400 || p.y > H+400) return;
+        GetTextExtentPoint32A(hdc, txt, (int)strlen(txt), &sz);
+        TextOutA(hdc, (int)p.x - sz.cx - margin, (int)p.y - sz.cy/2, txt, (int)strlen(txt));
+    };
+
+    HFONT hft = CreateFontA(-TS, 0,0,0, FW_NORMAL,0,0,0,
+        ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH|FF_SWISS, "Arial");
+    SelectObject(hdc, hft);
+
+    // --- t-axis ---
+    SetTextColor(hdc, RGB(255,140,140));
+    for (int k=0; k<=NK; k++) {
+        float frac=(float)k/NK;
+        snprintf(buf,sizeof(buf),"%.2f", surf.t0+(surf.t1-surf.t0)*frac);
+        draw_cen(-L+2.f*L*frac, YB-0.14f, 0.f, buf, 0, TS/2);
+    }
+    draw_cen(L+0.16f, YB, 0.f, "t", 0, 0);
+
+    // --- V-axis ---
+    SetTextColor(hdc, RGB(140,255,140));
+    for (int k=0; k<=NK; k++) {
+        float frac=(float)k/NK;
+        snprintf(buf,sizeof(buf),"%.3f", surf.vmin+(surf.vmax-surf.vmin)*frac);
+        draw_right(-0.10f, YB+1.5f*frac, 0.f, buf, TS/3);
+    }
+    draw_cen(0.f, YB+1.64f, 0.f, "V", 0, 0);
+
+    // --- x-axis ---
+    SetTextColor(hdc, RGB(140,140,255));
+    for (int k=0; k<=NK; k++) {
+        float frac=(float)k/NK;
+        snprintf(buf,sizeof(buf),"%.2f", surf.x0+(surf.x1-surf.x0)*frac);
+        draw_cen(0.f, YB-0.14f, -L+2.f*L*frac, buf, 0, TS/2);
+    }
+    draw_cen(0.f, YB, L+0.16f, "x", 0, 0);
+
+    // --- parameter info box (top-left corner) ---
+    {
+        HFONT hfp = CreateFontA(-PS, 0,0,0, FW_NORMAL,0,0,0,
+            ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, DEFAULT_PITCH|FF_SWISS, "Consolas");
+        SelectObject(hdc, hfp);
+
+        char l0[] = "V(t,x) Surface Visualizer";
+        char l1[128], l2[128], l3[128];
+        snprintf(l1,sizeof(l1),"g = %-8.4f   s  = %-8.4f   r0 = %.4f",
+            params.gamma_v, params.sigma, params.r0);
+        snprintf(l2,sizeof(l2),"T = %-8.3f   mu0= %-8.4f   L  = %.4f",
+            params.T_mat, params.mu0, params.lambda);
+        snprintf(l3,sizeof(l3),"x = [%.2f, %.2f]   t = [%.3f, %.3f]   N = %d",
+            surf.x0, surf.x1, surf.t0, surf.t1, surf.N);
+        const char* lines[] = { l0, l1, l2, l3, nullptr };
+
+        GetTextExtentPoint32A(hdc, "Xg", 2, &sz);
+        int lh = sz.cy + PS/3;
+        int mw = 0, n = 0;
+        for (const char** l=lines; *l; l++, n++) {
+            SIZE s; GetTextExtentPoint32A(hdc,*l,(int)strlen(*l),&s);
+            if (s.cx>mw) mw=s.cx;
+        }
+        int PAD=PS, bx=40, by=40;
+        RECT rc = {bx, by, bx+mw+2*PAD, by+n*lh+2*PAD};
+
+        HBRUSH hbr = CreateSolidBrush(RGB(5,5,15));
+        FillRect(hdc, &rc, hbr); DeleteObject(hbr);
+        HBRUSH hbr2 = CreateSolidBrush(RGB(40,40,70));
+        FrameRect(hdc, &rc, hbr2); DeleteObject(hbr2);
+
+        SetTextColor(hdc, RGB(190,215,255));
+        int cy = by+PAD;
+        for (const char** l=lines; *l; l++) {
+            TextOutA(hdc, bx+PAD, cy, *l, (int)strlen(*l));
+            cy += lh;
+        }
+
+        SelectObject(hdc, hft);
+        DeleteObject(hfp);
+    }
+
+    GdiFlush();
+
+    // DIB (BGR, bottom-up) → GL pixels (RGB, bottom-up)
+    for (int y = 0; y < H; y++) {
+        const BYTE* s = dib           + (size_t)y * stride;
+        uint8_t*    d = pixels.data() + (size_t)y * W * 3;
+        for (int x = 0; x < W; x++) { d[x*3]=s[x*3+2]; d[x*3+1]=s[x*3+1]; d[x*3+2]=s[x*3]; }
+    }
+
+    SelectObject(hdc, old_bm);
+    DeleteObject(hft);
+    DeleteObject(hbm);
+    DeleteDC(hdc);
+}
+#endif
+
+static void export_4k(const Surface& surf, const Params& params) {
+    const int EW = 3840, EH = 2160;
+    if (!g_fbo_ok) { g_export_status = "FBO not supported on this GPU"; return; }
+
+    GLuint fbo=0, tex=0, rbo=0;
+    s_GenFBO(1, &fbo);
+    s_BindFBO(GL_FRAMEBUFFER, fbo);
+
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, EW, EH, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    s_FBOTex(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+
+    s_GenRBO(1, &rbo);
+    s_BindRBO(GL_RENDERBUFFER, rbo);
+    s_RBOStor(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, EW, EH);
+    s_FBORBO(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, rbo);
+
+    if (s_ChkFBO(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        g_export_status = "FBO incomplete — export failed";
+        s_BindFBO(GL_FRAMEBUFFER, 0);
+        s_DelFBO(1, &fbo); glDeleteTextures(1, &tex); s_DelRBO(1, &rbo);
+        return;
+    }
+
+    glViewport(0, 0, EW, EH);
+    glClearColor(0.03f, 0.03f, 0.05f, 1.f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glEnable(GL_DEPTH_TEST);
+
+    float oh = g_ortho, ow = oh * ((float)EW / EH);
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    glOrtho(-ow, ow, -oh, oh, -50.0, 50.0);
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+    glTranslatef(0.f, -0.1f, -5.f);
+    glRotatef(g_rotX, 1.f, 0.f, 0.f);
+    glRotatef(g_rotY, 0.f, 1.f, 0.f);
+    glGetFloatv(GL_MODELVIEW_MATRIX,  g_mv);
+    glGetFloatv(GL_PROJECTION_MATRIX, g_proj);
+    g_vp[0]=0; g_vp[1]=0; g_vp[2]=EW; g_vp[3]=EH;
+
+    draw_floor_grid(-0.75f);
+    draw_axes_and_labels(surf);
+    draw_surface(surf);
+
+    std::vector<uint8_t> pixels((size_t)EW * EH * 3);
+    glReadPixels(0, 0, EW, EH, GL_RGB, GL_UNSIGNED_BYTE, pixels.data());
+
+#ifdef _WIN32
+    overlay_text_gdi(pixels, EW, EH, surf, params);
+#endif
+
+    s_BindFBO(GL_FRAMEBUFFER, 0);
+    s_DelFBO(1, &fbo);
+    glDeleteTextures(1, &tex);
+    s_DelRBO(1, &rbo);
+
+    time_t now = time(nullptr);
+    struct tm* lt = localtime(&now);
+    char ts[32];
+    strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", lt);
+
+    char cwd[512] = {};
+#ifdef _WIN32
+    GetCurrentDirectoryA(sizeof(cwd), cwd);
+#else
+    getcwd(cwd, sizeof(cwd));
+#endif
+    std::string base = std::string(cwd) + "\\" + "V_surface_" + ts;
+    std::string bmp_path = base + ".bmp";
+    bool ok = save_bmp(bmp_path, EW, EH, pixels.data());
+
+    std::string csv_path = base + ".csv";
+    if (FILE* cf = fopen(csv_path.c_str(), "w")) {
+        fprintf(cf, "# g=%.6f s=%.6f r0=%.6f T=%.6f mu0=%.6f lam=%.6f\n",
+            params.gamma_v, params.sigma, params.r0, params.T_mat, params.mu0, params.lambda);
+        fprintf(cf, "t,x,V\n");
+        int N = surf.N;
+        for (int i = 0; i < N; i++) {
+            double t = surf.t0 + (surf.t1 - surf.t0) * (double)i / (N-1);
+            for (int j = 0; j < N; j++) {
+                double x = surf.x0 + (surf.x1 - surf.x0) * (double)j / (N-1);
+                fprintf(cf, "%.6f,%.6f,%.9f\n", t, x, compute_V(t, x, params));
+            }
+        }
+        fclose(cf);
+    }
+
+    g_export_status = ok ? "Saved: " + bmp_path + " + .csv"
+                         : "BMP write failed";
+}
+
+// =============================================================================
 //  main
 // =============================================================================
 int main() {
@@ -535,6 +878,7 @@ int main() {
     if (!win) { glfwTerminate(); return 1; }
     glfwMakeContextCurrent(win);
     glfwSwapInterval(1);
+    init_fbo_ext();
 
     glfwSetMouseButtonCallback(win, cb_mouse);
     glfwSetCursorPosCallback(win, cb_cursor);
@@ -563,12 +907,18 @@ int main() {
     Params params;
     Surface surf = build_surface(params);   // initial synchronous build
     g_dirty = false;
+    float g_ortho_prev = g_ortho;
 
-    const double GAMMA_5_8 = std::tgamma(5.0 / 8.0);
+    const double GAMMA_3_4 = std::tgamma(3.0 / 4.0);
     const int PANEL = 370;
 
     while (!glfwWindowShouldClose(win)) {
         glfwPollEvents();
+
+        if (g_do_export) {
+            g_do_export = false;
+            export_4k(surf, params);
+        }
 
         // --- Swap in completed surface ---
         if (g_result_ready.load()) {
@@ -583,6 +933,19 @@ int main() {
                 g_dirty = false;
                 start_compute(params);
             }
+        }
+
+        // Auto-scale x domain when zoom changes
+        if (params.zoom_domain && g_ortho != g_ortho_prev) {
+            // At g_ortho=1.8, reference half-width = 1.5
+            float half = 1.5f * (g_ortho / 1.8f);
+            half = half < 0.1f ? 0.1f : half > 15.f ? 15.f : half;
+            params.x_max = half;
+            params.x_min = params.pos_domain ? 0.f : -half;
+            g_dirty = true;
+            g_ortho_prev = g_ortho;
+        } else {
+            g_ortho_prev = g_ortho;
         }
 
         // Kick off compute if needed and not already running
@@ -654,7 +1017,7 @@ int main() {
         ImGui::PushStyleColor(ImGuiCol_Text,{0.68f,0.92f,0.60f,1.f});
         ImGui::TextWrapped("V = g*sqrt(sqrt(2)*s/pi)");
         ImGui::TextWrapped("  * exp(-r0/2*(T^2-t^2))");
-        ImGui::TextWrapped("  * (T-t)^(1/4) * Gamma(5/8)");
+        ImGui::TextWrapped("  * (T-t)^(1/4) * Gamma(3/4)");
         ImGui::TextWrapped("  * 1F1(-1/4 ; 1/2 ; -z)");
         ImGui::PushStyleColor(ImGuiCol_Text,{0.55f,0.80f,0.50f,1.f});
         ImGui::TextWrapped("z=[x+(m/L)*(sin(L*T)-sin(L*t))]/(2s^2*(T-t))");
@@ -662,7 +1025,7 @@ int main() {
         ImGui::PopStyleColor();
 
         ImGui::PushStyleColor(ImGuiCol_Text,{0.42f,0.42f,0.55f,1.f});
-        ImGui::Text("  Gamma(5/8) = %.7f", GAMMA_5_8);
+        ImGui::Text("  Gamma(3/4) = %.7f", GAMMA_3_4);
         ImGui::PopStyleColor();
 
         ImGui::Spacing(); ImGui::Separator();
@@ -674,8 +1037,18 @@ int main() {
         ImGui::PopStyleColor();
         ImGui::Spacing();
 
-#define SLI(lbl,fld,lo,hi,fmt) \
-        if (ImGui::SliderFloat(lbl, &params.fld, lo, hi, fmt)) g_dirty=true;
+#define SLI(lbl,fld,lo,hi,fmt) { \
+    float _lo=(lo), _hi=(hi); \
+    ImGui::PushItemWidth(168.f); \
+    bool _c = ImGui::SliderFloat("##sl_" #fld, &params.fld, _lo, _hi, fmt); \
+    ImGui::PopItemWidth(); \
+    ImGui::SameLine(0.f,4.f); \
+    ImGui::PushItemWidth(72.f); \
+    _c |= ImGui::InputFloat("##in_" #fld, &params.fld, 0.f, 0.f, fmt); \
+    ImGui::PopItemWidth(); \
+    ImGui::SameLine(0.f,5.f); ImGui::TextUnformatted(lbl); \
+    if (_c) { params.fld=params.fld<_lo?_lo:params.fld>_hi?_hi:params.fld; g_dirty=true; } \
+}
         SLI("g  (gamma)",    gamma_v,  0.001f, 20.f,  "%.4f")
         SLI("s  (sigma)",    sigma,    0.005f,  2.0f, "%.4f")
         SLI("r0",            r0,      -0.5f,   2.0f,  "%.4f")
@@ -696,12 +1069,56 @@ int main() {
         {
             float tmax = params.T_mat * 0.90f;
             if (params.t_min > tmax) params.t_min = tmax;
-            if (ImGui::SliderFloat("t_min", &params.t_min, 0.f, tmax, "%.3f"))
-                g_dirty = true;
+            ImGui::PushItemWidth(168.f);
+            bool _c = ImGui::SliderFloat("##sl_tmin", &params.t_min, 0.f, tmax, "%.3f");
+            ImGui::PopItemWidth();
+            ImGui::SameLine(0.f,4.f); ImGui::PushItemWidth(72.f);
+            _c |= ImGui::InputFloat("##in_tmin", &params.t_min, 0.f, 0.f, "%.3f");
+            ImGui::PopItemWidth();
+            ImGui::SameLine(0.f,5.f); ImGui::TextUnformatted("t_min");
+            if (_c) { params.t_min=params.t_min<0.f?0.f:params.t_min>tmax?tmax:params.t_min; g_dirty=true; }
         }
-        if (ImGui::SliderFloat("x_min", &params.x_min, -15.f, 0.f,  "%.2f")) g_dirty=true;
-        if (ImGui::SliderFloat("x_max", &params.x_max,   0.f, 15.f, "%.2f")) g_dirty=true;
-        if (ImGui::SliderFloat("clip %", &params.clip_pct, 0.f, 10.f, "%.1f%%"))
+        if (ImGui::Checkbox("Scale domain with zoom", &params.zoom_domain))
+            g_dirty = true;
+        if (ImGui::Checkbox("t, x positive only", &params.pos_domain)) {
+            if (params.pos_domain && params.x_min < 0.f) params.x_min = 0.f;
+            g_dirty = true;
+        }
+        if (params.pos_domain) {
+            ImGui::BeginDisabled();
+            ImGui::SliderFloat("x_min (locked)", &params.x_min, 0.f, 0.f, "0.00");
+            ImGui::EndDisabled();
+        } else {
+            ImGui::PushItemWidth(168.f);
+            bool _c = ImGui::SliderFloat("##sl_xmin", &params.x_min, -15.f, 0.f, "%.2f");
+            ImGui::PopItemWidth();
+            ImGui::SameLine(0.f,4.f); ImGui::PushItemWidth(72.f);
+            _c |= ImGui::InputFloat("##in_xmin", &params.x_min, 0.f, 0.f, "%.2f");
+            ImGui::PopItemWidth();
+            ImGui::SameLine(0.f,5.f); ImGui::TextUnformatted("x_min");
+            if (_c) { params.x_min=params.x_min<-15.f?-15.f:params.x_min>0.f?0.f:params.x_min; g_dirty=true; }
+        }
+        {
+            ImGui::PushItemWidth(168.f);
+            bool _c = ImGui::SliderFloat("##sl_xmax", &params.x_max, 0.f, 15.f, "%.2f");
+            ImGui::PopItemWidth();
+            ImGui::SameLine(0.f,4.f); ImGui::PushItemWidth(72.f);
+            _c |= ImGui::InputFloat("##in_xmax", &params.x_max, 0.f, 0.f, "%.2f");
+            ImGui::PopItemWidth();
+            ImGui::SameLine(0.f,5.f); ImGui::TextUnformatted("x_max");
+            if (_c) { params.x_max=params.x_max<0.f?0.f:params.x_max>15.f?15.f:params.x_max; g_dirty=true; }
+        }
+        {
+            ImGui::PushItemWidth(168.f);
+            bool _c = ImGui::SliderFloat("##sl_clip", &params.clip_pct, 0.f, 10.f, "%.1f%%");
+            ImGui::PopItemWidth();
+            ImGui::SameLine(0.f,4.f); ImGui::PushItemWidth(72.f);
+            _c |= ImGui::InputFloat("##in_clip", &params.clip_pct, 0.f, 0.f, "%.1f");
+            ImGui::PopItemWidth();
+            ImGui::SameLine(0.f,5.f); ImGui::TextUnformatted("clip %");
+            if (_c) { params.clip_pct=params.clip_pct<0.f?0.f:params.clip_pct>10.f?10.f:params.clip_pct; g_dirty=true; }
+        }
+        if (ImGui::Checkbox("|V| (force positive)", &params.force_pos))
             g_dirty = true;
 
         ImGui::Spacing(); ImGui::Separator();
@@ -780,6 +1197,35 @@ int main() {
             ImGui::Text("Grid: %d x %d", surf.N, surf.N);
             ImGui::Text("Raw V: [%.3f, %.3f]", surf.v_raw_min, surf.v_raw_max);
             ImGui::Text("Axes:  red=t  green=V  blue=x");
+            ImGui::PopStyleColor();
+        }
+
+        ImGui::Spacing(); ImGui::Separator();
+
+        // ---- Export ----
+        ImGui::Spacing();
+        ImGui::PushStyleColor(ImGuiCol_Text, {0.52f,0.82f,1.f,1.f});
+        ImGui::Text("  Export");
+        ImGui::PopStyleColor();
+        ImGui::Spacing();
+
+        if (!g_fbo_ok) {
+            ImGui::PushStyleColor(ImGuiCol_Text, {0.75f,0.40f,0.40f,1.f});
+            ImGui::TextWrapped("FBO not available on this GPU");
+            ImGui::PopStyleColor();
+        } else {
+            bool busy = g_computing.load();
+            if (busy) ImGui::BeginDisabled();
+            ImGui::PushStyleColor(ImGuiCol_Button,        {0.15f,0.38f,0.18f,1.f});
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, {0.22f,0.54f,0.26f,1.f});
+            if (ImGui::Button("Export 4K BMP + CSV", {-1,0}))
+                g_do_export = true;
+            ImGui::PopStyleColor(2);
+            if (busy) ImGui::EndDisabled();
+        }
+        if (!g_export_status.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, {0.40f,0.40f,0.54f,1.f});
+            ImGui::TextWrapped("%s", g_export_status.c_str());
             ImGui::PopStyleColor();
         }
 
